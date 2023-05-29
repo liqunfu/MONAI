@@ -155,7 +155,8 @@ class TestEvaluatorToOnnx(unittest.TestCase):
             ]
         )
 
-        opset_version = 18
+        use_onnx_opset_version_20 = False
+        opset_version = 20 if use_onnx_opset_version_20 else 18
         with torch.no_grad():
             temp_module = TempModule(preprocessing=preprocess_transforms, preprocessing_key="image", image_meta_dict=image_meta_dict)
 
@@ -191,7 +192,12 @@ class TestEvaluatorToOnnx(unittest.TestCase):
             # print(set(unconvertible_ops))
 
             f = io.BytesIO()
-            torch.onnx.export(temp_module, loaded_image_tensor, f, verbose=False, opset_version=18)
+            if use_onnx_opset_version_20:
+                torch.onnx.export(temp_module, loaded_image_tensor, f, verbose=False, opset_version=opset_version,
+                                  onnx_shape_inference=False)
+            else:
+                torch.onnx.export(temp_module, loaded_image_tensor, f, verbose=False, opset_version=opset_version)
+            
             onnx_model = onnx.load_model_from_string(f.getvalue())
             print(onnx_model)
             onnx.save(onnx_model, "c:/temp/test_preprocessing.onnx")
