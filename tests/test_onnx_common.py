@@ -483,7 +483,7 @@ def register_custom_op(opset_version: int = 12) -> None:
         if True:
             align_corners_i = 0 if align_corners else 1
             return g.op(
-                "onnx::AffineGrid",
+                "custom::AffineGrid",
                 theta,
                 size,
                 align_corners_i=align_corners_i
