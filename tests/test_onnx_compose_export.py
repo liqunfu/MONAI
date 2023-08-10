@@ -48,7 +48,7 @@ from onnxscript.onnx_opset import opset15 as op
 from onnxscript.onnx_types import FLOAT, INT64
 from onnxscript.tests.common import onnx_script_test_case, testutils
 
-from onnxscript.tests.models.pnp import roi_indices_3d, aggrregate_predictor_output, sliding_window_inference, predict_mock, predict_mock_2, Opset18Ext
+from onnxscript.tests.models.pnp import roi_indices_3d, aggregate_predictor_output, sliding_window_inference, predict_mock, predict_mock_2, Opset18Ext
 
 
 TEST_CASE_1 = [os.path.join(os.path.dirname(__file__), "testing_data", "inference.json")]
@@ -63,6 +63,7 @@ TEST_CASE_5 = ["C:/LiqunWA/MONAI/model-zoo-fork/models/wholeBody_ct_segmentation
 
 import torch
 import onnx
+from onnx import ModelProto
 import onnxruntime as ort
 import io
 
@@ -367,22 +368,9 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
                 postprocessed_image_and_image_meta_dict_pair = process(postprocessed_image_and_image_meta_dict_pair)
         return postprocessed_image_and_image_meta_dict_pair["pred"]
 
-    def export_compose(pnp_compose, opset_version, input_tensor, output_tensor, image_meta_dict, task_name):
-        compose_wrapper = ComposeWrapper(pnp_compose, image_meta_dict, "image")
-
-        f = io.BytesIO()
-        torch.onnx.export(compose_wrapper, input_tensor, f, opset_version=opset_version)
-
-        onnx_model = onnx.load_model_from_string(f.getvalue())
-
-        onnx.save(onnx_model, f"c:/temp/monai_{task_name}_preprocessing_compose.onnx")
-
-        try:
-            validate_with_ort(onnx_model, [input_tensor], [output_tensor])
-            save_onnx_test_case(onnx_model, [input_tensor.detach().numpy()], [output_tensor.detach().numpy()], f"c:/temp/monai_{task_name}_preprocessing_compose")
-        except Exception as e:
-            # FAIL : Fatal error: custom:AffineGrid(-1) is not a registered function/op
-            print(f"Failed to validate {task_name} with ort: {e}")
+    from typing import Sequence, Dict, Any
+    def export_compose(pnp_compose: Compose, opset_version: int, inputs: Sequence[np.ndarray], outputs: Sequence[np.ndarray], image_meta_dict: Dict[str, Any], task_name: str) -> ModelProto:
+        pass
 
     @parameterized.expand([
         # TEST_CASE_1,
@@ -416,7 +404,9 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
         processed_output_metatensor = processed_image_and_image_meta_dict_pair["image"]
         output_tensor = processed_output_metatensor.as_tensor()
 
-        self._show_image_and_output_tensor(input_meta_tensor, processed_output_metatensor,)
+        show_image = False
+        if show_image:
+            self._show_image_and_output_tensor(input_meta_tensor, processed_output_metatensor,)
 
         compose_wrapper = ComposeWrapper(preprocessing, image_meta_dict, "image")
 
@@ -471,12 +461,14 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
         input_image_metatensor = inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["image"]
         pred_metatensor = inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["pred"]
 
-        # for ONNX presentation, show input in coronal view, no grid, correct aspect_ratio
-        self._show_image_and_output_tensor(input_image_metatensor, pred_metatensor, show_coronal=True, show_grid=False, aspect_ratio=aspect_ratio)
-        # for ONNX presentation, axial view, no grid, no need to correct aspect_ratio
-        self._show_image_and_output_tensor(input_image_metatensor, pred_metatensor, show_coronal=False, show_grid=False)
-        # for ONNX presentation, show input and pred with sliding window gird in axial view, enhance the image
-        self._show_image_and_output_tensor(input_image_metatensor, pred_metatensor, show_coronal=False, show_grid=True, enhance=False)
+        show_image = False
+        if show_image:
+            # for ONNX presentation, show input in coronal view, no grid, correct aspect_ratio
+            self._show_image_and_output_tensor(input_image_metatensor, pred_metatensor, show_coronal=True, show_grid=False, aspect_ratio=aspect_ratio)
+            # for ONNX presentation, axial view, no grid, no need to correct aspect_ratio
+            self._show_image_and_output_tensor(input_image_metatensor, pred_metatensor, show_coronal=False, show_grid=False)
+            # for ONNX presentation, show input and pred with sliding window gird in axial view, enhance the image
+            self._show_image_and_output_tensor(input_image_metatensor, pred_metatensor, show_coronal=False, show_grid=True, enhance=False)
 
         # prepare and run postprocessing
         pred_and_image_meta_dict = {
@@ -484,10 +476,11 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
             "image_meta_dict": inferer.parser.ref_resolver.resolved_content["evaluator"].state.batch[0]["image_meta_dict"]}
         post_processed_metatensor = self._run_postprocessing(postprocessing, pred_and_image_meta_dict)
 
-        # for ONNX presentation, show segmentation in axial view
-        self._show_image_and_output_tensor(input_image_metatensor, post_processed_metatensor, show_coronal=False, show_grid=False)
-        # for ONNX presentation, show segmentation in coronal view
-        self._show_image_and_output_tensor(input_image_metatensor, post_processed_metatensor, show_coronal=True, show_grid=False, aspect_ratio=aspect_ratio)
+        if show_image:
+            # for ONNX presentation, show segmentation in axial view
+            self._show_image_and_output_tensor(input_image_metatensor, post_processed_metatensor, show_coronal=False, show_grid=False)
+            # for ONNX presentation, show segmentation in coronal view
+            self._show_image_and_output_tensor(input_image_metatensor, post_processed_metatensor, show_coronal=True, show_grid=False, aspect_ratio=aspect_ratio)
 
         image_meta_dict = inferer.parser.ref_resolver.resolved_content["evaluator"].state.batch[0]["image_meta_dict"]
         compose_wrapper = ComposeWrapper(postprocessing, image_meta_dict, "pred")
@@ -541,7 +534,9 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
         image_meta_tensor = torch.unsqueeze(image_meta_tensor, 0)
         pred_meta_tensor = torch.unsqueeze(pred_meta_tensor, 0)
 
-        self._show_image_and_output_tensor(image_meta_tensor, pred_meta_tensor,)
+        show_image = False
+        if show_image:
+            self._show_image_and_output_tensor(image_meta_tensor, pred_meta_tensor,)
 
         print("run sliding window with model.pt")
         predictor.load_state_dict(torch.load("C:/LiqunWA/MONAI/model-zoo-fork/models/spleen_ct_segmentation/models/model.pt"))
@@ -555,7 +550,8 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
             sliding_window_inferer.overlap,
             )
         actual_output_sw = sw(image_meta_tensor, predictor)
-        self._show_image_and_output_tensor(image_meta_tensor, actual_output_sw, actual_output_sw2,)
+        if show_image:
+            self._show_image_and_output_tensor(image_meta_tensor, actual_output_sw, actual_output_sw2,)
         self.assertTrue(torch.allclose(actual_output_sw, actual_output_sw2))
 
         # override sw_batch_size to 1 and overlap to 0
@@ -572,7 +568,8 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
             overlap_override,
             )
         actual_output_sw_o = sw_o(image_meta_tensor, predictor)
-        self._show_image_and_output_tensor(image_meta_tensor, actual_output_sw_o, actual_output_sw2_o,)
+        if show_image:
+            self._show_image_and_output_tensor(image_meta_tensor, actual_output_sw_o, actual_output_sw2_o,)
         self.assertTrue(torch.allclose(actual_output_sw_o, actual_output_sw2_o))
 
 
@@ -592,12 +589,17 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
         inferer.run()
         inferer.finalize()
 
-        self._show_image_and_output_tensor(
-            inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["image"],
-            inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["pred"],)
+        show_image = False
+        if show_image:
+            self._show_image_and_output_tensor(
+                inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["image"],
+                inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["pred"],)
 
         print("completed")
 
+    # TODO: 07/27/2023
+    # this test case fails to pass self.run_eager_test(case), shall use self._show_image_and_output_tensor
+    # to show eager output and compare with sw output
     @parameterized.expand([
         TEST_CASE_4,
         ])
@@ -625,7 +627,13 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
 
         predictor_input_meta_tensor = inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["image"]
         predictor_output_meta_tensor = inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["pred"]
-        self._show_image_and_output_tensor(predictor_input_meta_tensor, predictor_output_meta_tensor,)
+        
+        predictor_input_meta_tensor = torch.unsqueeze(predictor_input_meta_tensor, 0)
+        predictor_output_meta_tensor = torch.unsqueeze(predictor_output_meta_tensor, 0)
+
+        show_image = False
+        if show_image:
+            self._show_image_and_output_tensor(predictor_input_meta_tensor, predictor_output_meta_tensor,)
 
         sw_o = SlidingWindowInferer(
             override["inferer#roi_size"], override["inferer#sw_batch_size"],
@@ -977,10 +985,12 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
         inferer.run()
         inferer.finalize()
 
-        # shpw the image and output tensor which can be predictor output or postprocessing output
-        self._show_image_and_output_tensor(
-            inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["image"],
-            inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["pred"],)
+        show_image = False
+        if show_image:
+            # show the image and output tensor which can be predictor output or postprocessing output
+            self._show_image_and_output_tensor(
+                inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["image"],
+                inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["pred"],)
 
         if inferer.postprocessing is None:
             # just showned the predictor output,
@@ -990,9 +1000,11 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
                 "image_meta_dict": inferer.parser.ref_resolver.resolved_content["evaluator"].state.batch[0]["image_meta_dict"]}
             post_processed = self._run_postprocessing(postprocessing, pred_and_image_meta_dict)
 
-            self._show_image_and_output_tensor(
-                inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["image"],
-                post_processed,)
+            show_image = False
+            if show_image:
+                self._show_image_and_output_tensor(
+                    inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["image"],
+                    post_processed,)
 
         print("")
 
