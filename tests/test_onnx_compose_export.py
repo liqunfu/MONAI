@@ -184,6 +184,94 @@ def save_onnx_test_case(model, inputs, outputs, output_dir):
                         ).SerializeToString()
                     )
 
+def save_rois_for_ort_test(network, opset_version, 
+                           predictor_input_meta_tensor, predictor_output_meta_tensor, 
+                           roi_size, task_name, path_to_save):
+    # save rois for ort test
+    # predictor_input_meta_tensor, predictor_output_meta_tensor are 3d tensors.
+    # predictor_input_meta_tensor: [1, 1, W, H, D]  NOTE: it is NOT D, H, W
+    # predictor_output_meta_tensor: [1, 2, W, H, D] 
+    # divide them into rois
+    # and save them as input and output for ort test, in predictor_output_meta_tensor. 
+    # for the last roi in each dimension, move back the start point to make sure the roi is within the image
+    os.makedirs(path_to_save, exist_ok=True)
+    predictor = monai.networks.convert_to_onnx(
+        network,
+        inputs=[torch.randn((1, 1, *roi_size), requires_grad=False),],
+        input_names=["image_roi"],
+        output_names=["pred_roi"],
+        opset_version=opset_version,
+        verify=True,
+        use_ort=True,
+        atol=1e-5,)
+
+    onnx.save(predictor, os.path.join(path_to_save, "predictor.onnx"));
+
+    N, C, H, W, D = predictor_input_meta_tensor.shape
+    N_out, C_out, W_out, H_out, D_out = predictor_output_meta_tensor.shape
+    roi_w, roi_h, roi_d = roi_size
+    input_file_name = f"{path_to_save}/{task_name}_input_{D}_{H}_{W}_{roi_d}_{roi_h}_{roi_w}.raw"
+    output_file_name = f"{path_to_save}/{task_name}_output_{D}_{H}_{W}_{roi_d}_{roi_h}_{roi_w}.raw"
+    predictor_input_meta_tensor.detach().cpu().numpy().tofile(input_file_name)
+    predictor_output_meta_tensor.detach().cpu().numpy().tofile(output_file_name)
+
+# loop over input and output tensors and save each ROI as a separate raw file
+    import matplotlib.pyplot as plt
+
+    row_per_roi = C + C_out
+    rows = int(np.ceil(D / roi_d)) * row_per_roi
+    cols_0 = int(np.ceil(H / roi_h))
+    cols_1 = int(np.ceil(W / roi_w))
+    cols = cols_0 * cols_1
+    fig, axs = plt.subplots(rows, cols, figsize=(10, 10))
+
+    for d in range(0, D, roi_d):
+        for h in range(0, H, roi_h):
+            for w in range(0, W, roi_w):
+                # adjust starting point if ROI extends beyond the bounds of the volume
+                d_start = d if d + roi_d <= D else D - roi_d
+                h_start = h if h + roi_h <= H else H - roi_h
+                w_start = w if w + roi_w <= W else W - roi_w
+                
+                roi_folder_name = f"{path_to_save}/{task_name}_roi_{d_start}_{h_start}_{w_start}"
+                os.makedirs(roi_folder_name, exist_ok=True)
+
+                input_roi = predictor_input_meta_tensor[0, 0, w_start:w_start+roi_w, h_start:h_start+roi_h, d_start:d_start+roi_d]
+                output_roi = predictor_output_meta_tensor[0, :, w_start:w_start+roi_w, h_start:h_start+roi_h, d_start:d_start+roi_d]
+                
+                # input_file_name = f"{path_to_save}/{task_name}_roi_input_{d_start}_{h_start}_{w_start}_{roi_d}_{roi_h}_{roi_w}.raw"
+                # output_file_name = f"{path_to_save}/{task_name}_roi_output_{d_start}_{h_start}_{w_start}_{roi_d}_{roi_h}_{roi_w}.raw"
+                input_file_name = f"{roi_folder_name}/{task_name}_roi_input_{d_start}_{h_start}_{w_start}_{roi_d}_{roi_h}_{roi_w}.raw"
+                output_file_name = f"{roi_folder_name}/{task_name}_roi_output_{d_start}_{h_start}_{w_start}_{roi_d}_{roi_h}_{roi_w}.raw"
+                
+                input_roi.detach().cpu().numpy().tofile(input_file_name)
+                output_roi.detach().cpu().numpy().tofile(output_file_name)
+
+                # load back saved ROI volume and display middle slice as an image
+                input_roi_loaded = np.fromfile(input_file_name, dtype=np.float32).reshape((roi_w, roi_h, roi_d))
+                output_roi_loaded = np.fromfile(output_file_name, dtype=np.float32).reshape((C_out, roi_w, roi_h, roi_d))
+                
+                input_middle_slice = input_roi_loaded[:, :, roi_d // 2]
+                
+                # display input and output middle slices as images in the corresponding subplot
+                row = d // roi_d + (1 if d % roi_d != 0 else 0)
+                col_0 = h // roi_h + (1 if h % roi_h != 0 else 0)
+                col_1 = w // roi_w + (1 if w % roi_w != 0 else 0)
+                col = col_0 * cols_0 + col_1
+                axs[row * row_per_roi, col].imshow(input_middle_slice, cmap='gray')
+                axs[row * row_per_roi, col].set_title(f"ROI input ({d_start}, {h_start}, {w_start})")
+
+                for c in range(C_out):
+                    output_slice = output_roi_loaded[c, :, :, roi_d // 2]
+                    axs[row * row_per_roi + c + 1, col].imshow(output_slice, cmap='gray')
+                    axs[row * row_per_roi + c + 1, col].set_title(f"ROI output ({d_start}, {h_start}, {w_start})")
+    
+    # adjust spacing between subplots and show the figure
+    fig.tight_layout()
+    fig.subplots_adjust(left=0, bottom=0, right=0.95, top=0.95, wspace=0.1, hspace=0.1)
+    plt.show()
+    print("wait here")
+
 class ComposeWrapper(torch.nn.Module):
     def __init__(self, compose, image_meta_dict, key):
         super().__init__()
@@ -229,6 +317,7 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
         from scipy.ndimage import zoom
         from skimage import exposure
 
+        plt.ion()
         image = input_tensor.detach().cpu().numpy() if isinstance(input_tensor, torch.Tensor) else input_tensor
         output = output_tensor.detach().cpu().numpy() if isinstance(output_tensor, torch.Tensor) else output_tensor
         output2 = output_tensor2.detach().cpu().numpy() if isinstance(output_tensor2, torch.Tensor) else output_tensor2
@@ -631,9 +720,20 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
         predictor_input_meta_tensor = torch.unsqueeze(predictor_input_meta_tensor, 0)
         predictor_output_meta_tensor = torch.unsqueeze(predictor_output_meta_tensor, 0)
 
-        show_image = False
+        show_image = True
         if show_image:
             self._show_image_and_output_tensor(predictor_input_meta_tensor, predictor_output_meta_tensor,)
+
+        save_rois = True
+        if save_rois:
+            task_name = parse_config_path_get_task_name(config_file)
+            save_rois_for_ort_test(predictor,
+                                    self.opset_version,
+                                    predictor_input_meta_tensor, 
+                                    predictor_output_meta_tensor,
+                                    override["inferer#roi_size"],
+                                    task_name,
+                                    "C:/Temp/sliding_window_predictor_sw_batch_size_is_1")
 
         sw_o = SlidingWindowInferer(
             override["inferer#roi_size"], override["inferer#sw_batch_size"],
