@@ -39,6 +39,81 @@ _nearest_mode = "nearest-exact" if pytorch_after(1, 11) else "nearest"
 
 __all__ = ["sliding_window_inference"]
 
+def _show_image_and_output_tensor(input_tensor, output_tensor, output_tensor2=None, show_coronal=False, slice_index=None, show_grid=False,
+                                    aspect_ratio=1, enhance=False):
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    from scipy.ndimage import zoom
+    from skimage import exposure
+
+    plt.ion()
+    image = input_tensor.detach().cpu().numpy() if isinstance(input_tensor, torch.Tensor) else input_tensor
+    output = output_tensor.detach().cpu().numpy() if isinstance(output_tensor, torch.Tensor) else output_tensor
+    output2 = output_tensor2.detach().cpu().numpy() if isinstance(output_tensor2, torch.Tensor) else output_tensor2
+
+    def get_channels(pred):
+        channels = pred.shape[-4] if pred is not None and len(pred.shape) > 3 else 1 if pred is not None else 0
+        if channels > 4:
+            channels = 4
+        return channels
+
+    sub_count = get_channels(image) + get_channels(output) + get_channels(output2)
+
+    plt.figure("check", (12, 6))
+    def show_image_channel(image, sub, slice_index=None, cmap="viridis"):
+        if show_coronal:
+            slice_index = slice_index or image.shape[-2] // 2
+        else:
+            slice_index = slice_index or image.shape[-1] // 2
+        for c in range(get_channels(image)):
+            ax = plt.subplot(1, sub_count, sub)
+            if show_coronal:
+                if len(image.shape) == 3:
+                    corrected_image = np.transpose(image[:, slice_index, ::-1]) # image will otherwise be up side down without -1:0
+                elif len(image.shape) == 4:
+                    corrected_image = np.transpose(image[c, :, slice_index, ::-1])
+                else:
+                    corrected_image = np.transpose(image[0, c, :, slice_index, ::-1])
+                if aspect_ratio != 1:
+                    original_height, original_width = corrected_image.shape
+                    corrected_height = original_height // aspect_ratio
+                    corrected_image = zoom(corrected_image, (corrected_height/original_height, 1.0))
+            else:
+                if len(image.shape) == 3:
+                    corrected_image = np.transpose(image[:, ::-1, slice_index])
+                elif len(image.shape) == 4:
+                    corrected_image = np.transpose(image[c, :, ::-1, slice_index])
+                else:
+                    corrected_image = np.transpose(image[0, c, :, ::-1, slice_index])
+            if enhance and cmap == "gray":
+                corrected_image = exposure.equalize_hist(corrected_image)
+            plt.imshow(corrected_image, cmap=cmap)
+            if show_grid:
+                cols, rows = 4, 4
+                grid_size = corrected_image.shape[-2] // rows + 5 # +5 to show that image size is not multiple of roi size 
+                for i in range(1, cols):
+                    plt.axvline(i * grid_size, color='r', linewidth=0.5)
+
+                # Draw the horizontal grid lines
+                for i in range(1, rows):
+                    plt.axhline(i * grid_size, color='r', linewidth=0.5)
+
+                x, y = 2, 2
+                rect = patches.Rectangle((x * grid_size, y * grid_size), grid_size, grid_size,
+                                        facecolor='red' if cmap == "viridis" else "yellow", alpha=0.2)
+                ax.add_patch(rect)
+                
+            sub += 1
+        return sub
+
+    sub = 1
+    sub = show_image_channel(image, sub, slice_index, cmap="gray")
+
+    if output is not None:
+        sub = show_image_channel(output, sub, slice_index)
+    if output2 is not None:
+        sub = show_image_channel(output2, sub, slice_index)
+    plt.show()
 
 def sliding_window_inference(
     inputs: torch.Tensor,
@@ -221,6 +296,10 @@ def sliding_window_inference(
         else:
             win_data = inputs[unravel_slice[0]].to(sw_device)
         seg_prob_out = predictor(win_data, *args, **kwargs)  # batched patch
+
+        show_tensor: bool = False
+        if show_tensor:
+            _show_image_and_output_tensor(win_data, seg_prob_out)
 
         # convert seg_prob_out to tuple seg_tuple, this does not allocate new memory.
         dict_keys, seg_tuple = _flatten_struct(seg_prob_out)

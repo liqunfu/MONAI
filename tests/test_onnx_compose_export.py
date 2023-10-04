@@ -184,6 +184,107 @@ def save_onnx_test_case(model, inputs, outputs, output_dir):
                         ).SerializeToString()
                     )
 
+def _validate_with_ort(model, input_data, output_data):
+    ort_session = ort.InferenceSession(model.SerializeToString(), providers=['CPUExecutionProvider'])
+    assert len(ort_session.get_inputs()) == len(input_data)
+    ort_inputs = {}
+    for ort_input, input in zip(ort_session.get_inputs(), input_data):
+        if isinstance(input, torch.Tensor):
+            ort_inputs[ort_input.name] = input.detach().cpu().numpy()
+        else:
+            ort_inputs[ort_input.name] = input
+    ort_outs = ort_session.run(None, ort_inputs)
+    for (ort_out, output) in zip(ort_outs, output_data):
+        output_numpy = output.detach().cpu().numpy() if isinstance(output, torch.Tensor) else output
+        np.testing.assert_allclose(ort_out, output_numpy, rtol=1e-03, atol=1e-05)
+
+def _show_image_and_output_tensor(input_tensor, output_tensor, output_tensor2=None, show_coronal=False, slice_index=None, show_grid=False,
+                                    aspect_ratio=1, enhance=False):
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    from scipy.ndimage import zoom
+    from skimage import exposure
+
+    plt.ion()
+    image = input_tensor.detach().cpu().numpy() if isinstance(input_tensor, torch.Tensor) else input_tensor
+    output = output_tensor.detach().cpu().numpy() if isinstance(output_tensor, torch.Tensor) else output_tensor
+    output2 = output_tensor2.detach().cpu().numpy() if isinstance(output_tensor2, torch.Tensor) else output_tensor2
+
+    def get_channels(pred):
+        channels = pred.shape[-4] if pred is not None and len(pred.shape) > 3 else 1 if pred is not None else 0
+        if channels > 4:
+            channels = 4
+        return channels
+
+    sub_count = get_channels(image) + get_channels(output) + get_channels(output2)
+
+    plt.figure("check", (12, 6))
+    def show_image_channel(image, sub, slice_index=None, cmap="viridis"):
+        if show_coronal:
+            slice_index = slice_index or image.shape[-2] // 2
+        else:
+            slice_index = slice_index or image.shape[-1] // 2
+        for c in range(get_channels(image)):
+            ax = plt.subplot(1, sub_count, sub)
+            if show_coronal:
+                if len(image.shape) == 3:
+                    corrected_image = np.transpose(image[:, slice_index, ::-1]) # image will otherwise be up side down without -1:0
+                elif len(image.shape) == 4:
+                    corrected_image = np.transpose(image[c, :, slice_index, ::-1])
+                else:
+                    corrected_image = np.transpose(image[0, c, :, slice_index, ::-1])
+                if aspect_ratio != 1:
+                    original_height, original_width = corrected_image.shape
+                    corrected_height = original_height // aspect_ratio
+                    corrected_image = zoom(corrected_image, (corrected_height/original_height, 1.0))
+            else:
+                if len(image.shape) == 3:
+                    corrected_image = np.transpose(image[:, ::-1, slice_index])
+                elif len(image.shape) == 4:
+                    corrected_image = np.transpose(image[c, :, ::-1, slice_index])
+                else:
+                    corrected_image = np.transpose(image[0, c, :, ::-1, slice_index])
+            if enhance and cmap == "gray":
+                corrected_image = exposure.equalize_hist(corrected_image)
+            plt.imshow(corrected_image, cmap=cmap)
+            if show_grid:
+                cols, rows = 4, 4
+                grid_size = corrected_image.shape[-2] // rows + 5 # +5 to show that image size is not multiple of roi size 
+                for i in range(1, cols):
+                    plt.axvline(i * grid_size, color='r', linewidth=0.5)
+
+                # Draw the horizontal grid lines
+                for i in range(1, rows):
+                    plt.axhline(i * grid_size, color='r', linewidth=0.5)
+
+                x, y = 2, 2
+                rect = patches.Rectangle((x * grid_size, y * grid_size), grid_size, grid_size,
+                                        facecolor='red' if cmap == "viridis" else "yellow", alpha=0.2)
+                ax.add_patch(rect)
+                
+            sub += 1
+        return sub
+
+    sub = 1
+    sub = show_image_channel(image, sub, slice_index, cmap="gray")
+
+    if output is not None:
+        sub = show_image_channel(output, sub, slice_index)
+    if output2 is not None:
+        sub = show_image_channel(output2, sub, slice_index)
+    plt.show()
+
+def parse_path_get_se_batch_and_overlay(path):
+    import re
+    # extract the sw_batch value using a regular expression
+    sw_batch = int(re.search(r'sw_batch_(\d+)', path).group(1))
+
+    # extract the overlay value using a regular expression
+    overlay = float(re.search(r'overlay_(\d+\.\d+)', path).group(1))
+
+    return sw_batch, overlay
+
+
 def save_rois_for_ort_test(network, opset_version, 
                            predictor_input_meta_tensor, predictor_output_meta_tensor, 
                            roi_size, task_name, path_to_save):
@@ -203,9 +304,16 @@ def save_rois_for_ort_test(network, opset_version,
         opset_version=opset_version,
         verify=True,
         use_ort=True,
-        atol=1e-5,)
+        atol=1e-5,
+        dynamic_axes={"image_roi": {0: "N"}, "pred_roi": {0: "N"}},)
 
-    onnx.save(predictor, os.path.join(path_to_save, "predictor.onnx"));
+    onnx.save(predictor, os.path.join(path_to_save, "predictor.onnx"))
+
+    # work with cpu module and data
+    network.cuda()
+    network.eval()
+    predictor_input_meta_tensor = predictor_input_meta_tensor.cpu()
+    predictor_output_meta_tensor = predictor_output_meta_tensor.cpu()
 
     N, C, H, W, D = predictor_input_meta_tensor.shape
     N_out, C_out, W_out, H_out, D_out = predictor_output_meta_tensor.shape
@@ -215,6 +323,10 @@ def save_rois_for_ort_test(network, opset_version,
     predictor_input_meta_tensor.detach().cpu().numpy().tofile(input_file_name)
     predictor_output_meta_tensor.detach().cpu().numpy().tofile(output_file_name)
 
+    sw_batch, overlay = parse_path_get_se_batch_and_overlay(path_to_save)
+    if True or overlay != 0.0 or sw_batch != 1:
+        return
+    
 # loop over input and output tensors and save each ROI as a separate raw file
     import matplotlib.pyplot as plt
 
@@ -224,6 +336,7 @@ def save_rois_for_ort_test(network, opset_version,
     cols_1 = int(np.ceil(W / roi_w))
     cols = cols_0 * cols_1
     fig, axs = plt.subplots(rows, cols, figsize=(10, 10))
+    
 
     for d in range(0, D, roi_d):
         for h in range(0, H, roi_h):
@@ -232,8 +345,11 @@ def save_rois_for_ort_test(network, opset_version,
                 d_start = d if d + roi_d <= D else D - roi_d
                 h_start = h if h + roi_h <= H else H - roi_h
                 w_start = w if w + roi_w <= W else W - roi_w
+                no_overlap = d + 2 * roi_d <= D and h + 2 * roi_h <= H and w + 2 * roi_w <= W
                 
                 roi_folder_name = f"{path_to_save}/{task_name}_roi_{d_start}_{h_start}_{w_start}"
+                if not no_overlap:
+                    roi_folder_name = roi_folder_name + "_overlapped"
                 os.makedirs(roi_folder_name, exist_ok=True)
 
                 input_roi = predictor_input_meta_tensor[0, 0, w_start:w_start+roi_w, h_start:h_start+roi_h, d_start:d_start+roi_d]
@@ -265,6 +381,23 @@ def save_rois_for_ort_test(network, opset_version,
                     output_slice = output_roi_loaded[c, :, :, roi_d // 2]
                     axs[row * row_per_roi + c + 1, col].imshow(output_slice, cmap='gray')
                     axs[row * row_per_roi + c + 1, col].set_title(f"ROI output ({d_start}, {h_start}, {w_start})")
+
+
+                do_intermediate_validation = no_overlap
+                if do_intermediate_validation:
+                    # verify that ort works with predictor before saving rois for ort test 
+                    # the network expected batch and channel dimension
+                    input_roi_batched = torch.unsqueeze(torch.unsqueeze(input_roi, 0), 0).cuda()
+                    output_roi_batched = torch.unsqueeze(output_roi, 0)
+                    actual_output_roi_batched = network(input_roi_batched)
+                    show_intermediate_results = False
+                    if show_intermediate_results:
+                        _show_image_and_output_tensor(input_roi_batched, output_roi_batched)
+                        _show_image_and_output_tensor(input_roi_batched, actual_output_roi_batched)
+                    assert np.allclose(actual_output_roi_batched.detach().cpu().numpy(), output_roi_batched.detach().cpu().numpy(), rtol=1e-03, atol=1e-05)
+                    _validate_with_ort(predictor, [input_roi_batched.detach().cpu().numpy()], [output_roi_batched.detach().cpu().numpy()])
+
+
     
     # adjust spacing between subplots and show the figure
     fig.tight_layout()
@@ -310,94 +443,6 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
     def _is_spleen_ct_segmentation(self, config_file):
         return "spleen_ct_segmentation" in config_file
 
-    def _show_image_and_output_tensor(self, input_tensor, output_tensor, output_tensor2=None, show_coronal=False, slice_index=None, show_grid=False,
-                                      aspect_ratio=1, enhance=False):
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as patches
-        from scipy.ndimage import zoom
-        from skimage import exposure
-
-        plt.ion()
-        image = input_tensor.detach().cpu().numpy() if isinstance(input_tensor, torch.Tensor) else input_tensor
-        output = output_tensor.detach().cpu().numpy() if isinstance(output_tensor, torch.Tensor) else output_tensor
-        output2 = output_tensor2.detach().cpu().numpy() if isinstance(output_tensor2, torch.Tensor) else output_tensor2
-
-        def get_channels(pred):
-            channels = pred.shape[-4] if pred is not None and len(pred.shape) > 3 else 1 if pred is not None else 0
-            if channels > 4:
-                channels = 4
-            return channels
-
-        sub_count = get_channels(image) + get_channels(output) + get_channels(output2)
-
-        plt.figure("check", (12, 6))
-        def show_image_channel(image, sub, slice_index=None, cmap="viridis"):
-            if show_coronal:
-                slice_index = slice_index or image.shape[-2] // 2
-            else:
-                slice_index = slice_index or image.shape[-1] // 2
-            for c in range(get_channels(image)):
-                ax = plt.subplot(1, sub_count, sub)
-                if show_coronal:
-                    if len(image.shape) == 3:
-                        corrected_image = np.transpose(image[:, slice_index, ::-1]) # image will otherwise be up side down without -1:0
-                    elif len(image.shape) == 4:
-                        corrected_image = np.transpose(image[c, :, slice_index, ::-1])
-                    else:
-                        corrected_image = np.transpose(image[0, c, :, slice_index, ::-1])
-                    if aspect_ratio != 1:
-                        original_height, original_width = corrected_image.shape
-                        corrected_height = original_height // aspect_ratio
-                        corrected_image = zoom(corrected_image, (corrected_height/original_height, 1.0))
-                else:
-                    if len(image.shape) == 3:
-                        corrected_image = np.transpose(image[:, ::-1, slice_index])
-                    elif len(image.shape) == 4:
-                        corrected_image = np.transpose(image[c, :, ::-1, slice_index])
-                    else:
-                        corrected_image = np.transpose(image[0, c, :, ::-1, slice_index])
-                if enhance and cmap == "gray":
-                    corrected_image = exposure.equalize_hist(corrected_image)
-                plt.imshow(corrected_image, cmap=cmap)
-                if show_grid:
-                    cols, rows = 4, 4
-                    grid_size = corrected_image.shape[-2] // rows + 5 # +5 to show that image size is not multiple of roi size 
-                    for i in range(1, cols):
-                        plt.axvline(i * grid_size, color='r', linewidth=0.5)
-
-                    # Draw the horizontal grid lines
-                    for i in range(1, rows):
-                        plt.axhline(i * grid_size, color='r', linewidth=0.5)
-
-                    x, y = 2, 2
-                    rect = patches.Rectangle((x * grid_size, y * grid_size), grid_size, grid_size,
-                                            facecolor='red' if cmap == "viridis" else "yellow", alpha=0.2)
-                    ax.add_patch(rect)
-                    
-                sub += 1
-            return sub
-
-        sub = 1
-        sub = show_image_channel(image, sub, slice_index, cmap="gray")
-
-        if output is not None:
-            sub = show_image_channel(output, sub, slice_index)
-        if output2 is not None:
-            sub = show_image_channel(output2, sub, slice_index)
-        plt.show()
-
-    def _validate_with_ort(self, model, input_data, output_data):
-        ort_session = ort.InferenceSession(model.SerializeToString(), providers=['CPUExecutionProvider'])
-        assert len(ort_session.get_inputs()) == len(input_data)
-        ort_inputs = {}
-        for ort_input, input in zip(ort_session.get_inputs(), input_data):
-            if isinstance(input, torch.Tensor):
-                ort_inputs[ort_input.name] = input.detach().cpu().numpy()
-            else:
-                ort_inputs[ort_input.name] = input
-        ort_outs = ort_session.run(None, ort_inputs)
-        for (ort_out, output) in zip(ort_outs, output_data):
-            np.testing.assert_allclose(ort_out, output.detach().cpu().numpy(), rtol=1e-03, atol=1e-05)
 
     def _make_test_config_workflow_inferer(self, config_file, override=None):
         override = override if override is not None else {
@@ -495,7 +540,7 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
 
         show_image = False
         if show_image:
-            self._show_image_and_output_tensor(input_meta_tensor, processed_output_metatensor,)
+            _show_image_and_output_tensor(input_meta_tensor, processed_output_metatensor,)
 
         compose_wrapper = ComposeWrapper(preprocessing, image_meta_dict, "image")
 
@@ -518,7 +563,7 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
         onnx.save(onnx_model, f"c:/temp/monai_{task_name}_preprocessing_compose.onnx")
 
         try:
-            self._validate_with_ort(onnx_model, [input_tensor], [output_tensor])
+            _validate_with_ort(onnx_model, [input_tensor], [output_tensor])
             save_onnx_test_case(onnx_model, [input_tensor.detach().numpy()], [output_tensor.detach().numpy()], f"c:/temp/monai_{task_name}_preprocessing_compose")
         except Exception as e:
             # FAIL : Fatal error: custom:AffineGrid(-1) is not a registered function/op
@@ -553,11 +598,11 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
         show_image = False
         if show_image:
             # for ONNX presentation, show input in coronal view, no grid, correct aspect_ratio
-            self._show_image_and_output_tensor(input_image_metatensor, pred_metatensor, show_coronal=True, show_grid=False, aspect_ratio=aspect_ratio)
+            _show_image_and_output_tensor(input_image_metatensor, pred_metatensor, show_coronal=True, show_grid=False, aspect_ratio=aspect_ratio)
             # for ONNX presentation, axial view, no grid, no need to correct aspect_ratio
-            self._show_image_and_output_tensor(input_image_metatensor, pred_metatensor, show_coronal=False, show_grid=False)
+            _show_image_and_output_tensor(input_image_metatensor, pred_metatensor, show_coronal=False, show_grid=False)
             # for ONNX presentation, show input and pred with sliding window gird in axial view, enhance the image
-            self._show_image_and_output_tensor(input_image_metatensor, pred_metatensor, show_coronal=False, show_grid=True, enhance=False)
+            _show_image_and_output_tensor(input_image_metatensor, pred_metatensor, show_coronal=False, show_grid=True, enhance=False)
 
         # prepare and run postprocessing
         pred_and_image_meta_dict = {
@@ -567,9 +612,9 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
 
         if show_image:
             # for ONNX presentation, show segmentation in axial view
-            self._show_image_and_output_tensor(input_image_metatensor, post_processed_metatensor, show_coronal=False, show_grid=False)
+            _show_image_and_output_tensor(input_image_metatensor, post_processed_metatensor, show_coronal=False, show_grid=False)
             # for ONNX presentation, show segmentation in coronal view
-            self._show_image_and_output_tensor(input_image_metatensor, post_processed_metatensor, show_coronal=True, show_grid=False, aspect_ratio=aspect_ratio)
+            _show_image_and_output_tensor(input_image_metatensor, post_processed_metatensor, show_coronal=True, show_grid=False, aspect_ratio=aspect_ratio)
 
         image_meta_dict = inferer.parser.ref_resolver.resolved_content["evaluator"].state.batch[0]["image_meta_dict"]
         compose_wrapper = ComposeWrapper(postprocessing, image_meta_dict, "pred")
@@ -584,7 +629,7 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
         onnx.save(onnx_model, f"c:/temp/monai_{task_name}_postprocessing_compose.onnx")
 
         try:
-            self._validate_with_ort(onnx_model, [input_tensor], [post_processed_tensor])
+            _validate_with_ort(onnx_model, [input_tensor], [post_processed_tensor])
             save_onnx_test_case(onnx_model, [input_tensor.detach().numpy()], [post_processed_tensor.detach().numpy()], f"c:/temp/monai_{task_name}_postprocessing_compose")
         except Exception as e:
             # with TEST_CASE_5, due to size of sample input/output data tensor: Message onnx.TensorProto exceeds maximum protobuf size of 2GB: 5833780289
@@ -625,7 +670,7 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
 
         show_image = False
         if show_image:
-            self._show_image_and_output_tensor(image_meta_tensor, pred_meta_tensor,)
+            _show_image_and_output_tensor(image_meta_tensor, pred_meta_tensor,)
 
         print("run sliding window with model.pt")
         predictor.load_state_dict(torch.load("C:/LiqunWA/MONAI/model-zoo-fork/models/spleen_ct_segmentation/models/model.pt"))
@@ -640,7 +685,7 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
             )
         actual_output_sw = sw(image_meta_tensor, predictor)
         if show_image:
-            self._show_image_and_output_tensor(image_meta_tensor, actual_output_sw, actual_output_sw2,)
+            _show_image_and_output_tensor(image_meta_tensor, actual_output_sw, actual_output_sw2,)
         self.assertTrue(torch.allclose(actual_output_sw, actual_output_sw2))
 
         # override sw_batch_size to 1 and overlap to 0
@@ -658,7 +703,7 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
             )
         actual_output_sw_o = sw_o(image_meta_tensor, predictor)
         if show_image:
-            self._show_image_and_output_tensor(image_meta_tensor, actual_output_sw_o, actual_output_sw2_o,)
+            _show_image_and_output_tensor(image_meta_tensor, actual_output_sw_o, actual_output_sw2_o,)
         self.assertTrue(torch.allclose(actual_output_sw_o, actual_output_sw2_o))
 
 
@@ -680,14 +725,14 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
 
         show_image = False
         if show_image:
-            self._show_image_and_output_tensor(
+            _show_image_and_output_tensor(
                 inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["image"],
                 inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["pred"],)
 
         print("completed")
 
     # TODO: 07/27/2023
-    # this test case fails to pass self.run_eager_test(case), shall use self._show_image_and_output_tensor
+    # this test case fails to pass self.run_eager_test(case), shall use _show_image_and_output_tensor
     # to show eager output and compare with sw output
     @parameterized.expand([
         TEST_CASE_4,
@@ -698,10 +743,12 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
         # sliding_window_inference uses pred = op.OpaqueOp(win_data, model_path="C:/Temp/sliding_window_predictor_sw_batch_size_is_1.onnx")
         # the onnx model has fixed input size (64, 64, 32).
         # TODO: create a model with dynamic input size
+        inferer_overlap = 0.0
+        sw_batch_size = 5
         override = {
             "inferer#roi_size": [64, 64, 32],
-            "inferer#overlap": 0.0,
-            "inferer#sw_batch_size": 1,
+            "inferer#overlap": inferer_overlap,
+            "inferer#sw_batch_size": sw_batch_size,
         }
         inferer = self._make_test_config_workflow_inferer(config_file, override=override)
         inferer.initialize()
@@ -722,18 +769,18 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
 
         show_image = True
         if show_image:
-            self._show_image_and_output_tensor(predictor_input_meta_tensor, predictor_output_meta_tensor,)
+            _show_image_and_output_tensor(predictor_input_meta_tensor, predictor_output_meta_tensor,)
 
         save_rois = True
         if save_rois:
             task_name = parse_config_path_get_task_name(config_file)
-            save_rois_for_ort_test(predictor,
+            save_rois_for_ort_test(inferer.network_def,
                                     self.opset_version,
                                     predictor_input_meta_tensor, 
                                     predictor_output_meta_tensor,
                                     override["inferer#roi_size"],
                                     task_name,
-                                    "C:/Temp/sliding_window_predictor_sw_batch_size_is_1")
+                                    f"C:/Temp/sliding_window_predictor_sw_batch_{sw_batch_size}_overlay_{inferer_overlap}")
 
         sw_o = SlidingWindowInferer(
             override["inferer#roi_size"], override["inferer#sw_batch_size"],
@@ -848,7 +895,7 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
 
             onnx.save(onnx_model, f"c:/temp/monai_{task_name}_pad_inputs_if_needed_by_roi_size_script.onnx")
             try:
-                self._validate_with_ort(onnx_model, [inputs, roi_size], [expected_outputs, expected_pad_size])
+                _validate_with_ort(onnx_model, [inputs, roi_size], [expected_outputs, expected_pad_size])
                 save_onnx_test_case(onnx_model, [inputs, roi_size], [expected_outputs.detach().numpy(), expected_pad_size.detach().numpy()],
                                     f"c:/temp/monai_{task_name}_pad_inputs_if_needed_by_roi_size_script")
             except Exception as e:
@@ -897,7 +944,7 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
             expected_outputs.as_tensor(), roi_size, None, wrapper2.sw_batch_size, wrapper2.overlap, wrapper2.mode, wrapper2.sigma_scale)
 
         try:
-            self._validate_with_ort(
+            _validate_with_ort(
                 onnx_model2,
                 [expected_outputs.as_tensor(), roi_size, None, wrapper2.sw_batch_size, wrapper2.overlap, wrapper2.mode, wrapper2.sigma_scale],
                 [ex_windows_range, ex_importance_map, ex_num_win, ex_total_slices, ex_slices, ex_batch_size, ex_image_size])
@@ -943,7 +990,7 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
             ex_win_data, ex_unravel_slice = sw_prepare_win_data_for_predictor_script(inputs, slice_g, ex_num_win, ex_slices, ex_total_slices, wrapper3.sw_batch_size)
             # model has mismatched inputs
             # try:
-            #     self._validate_with_ort(onnx_model3, [inputs, slice_g, ex_num_win, ex_slices, ex_total_slices], [ex_win_data, ex_unravel_slice])
+            #     _validate_with_ort(onnx_model3, [inputs, slice_g, ex_num_win, ex_slices, ex_total_slices], [ex_win_data, ex_unravel_slice])
             #     save_onnx_test_case(
             #         onnx_model3,
             #         [inputs, slice_g, ex_num_win, ex_slices, ex_total_slices],
@@ -1088,7 +1135,7 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
         show_image = False
         if show_image:
             # show the image and output tensor which can be predictor output or postprocessing output
-            self._show_image_and_output_tensor(
+            _show_image_and_output_tensor(
                 inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["image"],
                 inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["pred"],)
 
@@ -1102,7 +1149,7 @@ class TestBundleWorkflowONNX(onnx_script_test_case.OnnxScriptTestCase):
 
             show_image = False
             if show_image:
-                self._show_image_and_output_tensor(
+                _show_image_and_output_tensor(
                     inferer.parser.ref_resolver.resolved_content["evaluator"].state.output[0]["image"],
                     post_processed,)
 
