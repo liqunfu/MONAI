@@ -45,6 +45,8 @@ doIsortFormat=false
 doIsortFix=false
 doFlake8Format=false
 doPylintFormat=false
+doRuffFormat=false
+doRuffFix=false
 doClangFormat=false
 doCopyRight=false
 doPytypeFormat=false
@@ -58,9 +60,10 @@ NUM_PARALLEL=1
 PY_EXE=${MONAI_PY_EXE:-$(which python)}
 
 function print_usage {
-    echo "runtests.sh [--codeformat] [--autofix] [--black] [--isort] [--flake8] [--pylint] [--clangformat] [--pytype] [--mypy]"
-    echo "            [--unittests] [--disttests] [--coverage] [--quick] [--min] [--net] [--dryrun] [-j number] [--list_tests]"
-    echo "            [--copyright] [--build] [--clean] [--precommit] [--help] [--version]"
+    echo "runtests.sh [--codeformat] [--autofix] [--black] [--isort] [--flake8] [--pylint] [--ruff]"
+    echo "            [--clangformat] [--precommit] [--pytype] [-j number] [--mypy]"
+    echo "            [--unittests] [--disttests] [--coverage] [--quick] [--min] [--net] [--build] [--list_tests]"
+    echo "            [--dryrun] [--copyright] [--clean] [--help] [--version] [--path] [--formatfix]"
     echo ""
     echo "MONAI unit testing utilities."
     echo ""
@@ -71,20 +74,22 @@ function print_usage {
     echo "./runtests.sh --quick --unittests     # run minimal unit tests, for quick verification during code developments."
     echo "./runtests.sh --autofix               # run automatic code formatting using \"isort\" and \"black\"."
     echo "./runtests.sh --clean                 # clean up temporary files and run \"${PY_EXE} setup.py develop --uninstall\"."
+    echo "./runtests.sh --formatfix -p /my/code # run automatic code formatting using \"isort\" and \"black\" in specified path."
     echo ""
     echo "Code style check options:"
-    echo "    --black           : perform \"black\" code format checks"
     echo "    --autofix         : format code using \"isort\" and \"black\""
+    echo "    --black           : perform \"black\" code format checks"
     echo "    --isort           : perform \"isort\" import sort checks"
     echo "    --flake8          : perform \"flake8\" code format checks"
     echo "    --pylint          : perform \"pylint\" code format checks"
+    echo "    --ruff            : perform \"ruff\" code format checks"
     echo "    --clangformat     : format csrc code using \"clang-format\""
     echo "    --precommit       : perform source code format check and fix using \"pre-commit\""
     echo ""
     echo "Python type check options:"
     echo "    --pytype          : perform \"pytype\" static type checks"
-    echo "    --mypy            : perform \"mypy\" static type checks"
     echo "    -j, --jobs        : number of parallel jobs to run \"pytype\" (default $NUM_PARALLEL)"
+    echo "    --mypy            : perform \"mypy\" static type checks"
     echo ""
     echo "MONAI unit testing options:"
     echo "    -u, --unittests   : perform unit testing"
@@ -103,6 +108,8 @@ function print_usage {
     echo "    -c, --clean       : clean temporary files from tests and exit"
     echo "    -h, --help        : show this help message and exit"
     echo "    -v, --version     : show MONAI and system version information and exit"
+    echo "    -p, --path        : specify the path used for formatting, default is the current dir if unspecified"
+    echo "    --formatfix       : format code using \"isort\" and \"black\" for user specified directories"
     echo ""
     echo "${separator}For bug reports and feature requests, please file an issue at:"
     echo "    https://github.com/Project-MONAI/MONAI/issues/new/choose"
@@ -204,7 +211,11 @@ function print_error_msg() {
 
 function print_style_fail_msg() {
     echo "${red}Check failed!${noColor}"
-    echo "Please run auto style fixes: ${green}./runtests.sh --autofix${noColor}"
+    if [ "$homedir" = "$currentdir" ]
+    then
+        echo "Please run auto style fixes: ${green}./runtests.sh --autofix${noColor}"
+    else :
+    fi
 }
 
 function list_unittests() {
@@ -257,7 +268,8 @@ do
             doBlackFormat=true
             doIsortFormat=true
             doFlake8Format=true
-            doPylintFormat=true
+            # doPylintFormat=true  # https://github.com/Project-MONAI/MONAI/issues/7094
+            doRuffFormat=true
             doCopyRight=true
         ;;
         --disttests)
@@ -269,9 +281,17 @@ do
         --autofix)
             doIsortFix=true
             doBlackFix=true
+            doRuffFix=true
             doIsortFormat=true
             doBlackFormat=true
+            doRuffFormat=true
             doCopyRight=true
+        ;;
+        --formatfix)
+            doIsortFix=true
+            doBlackFix=true
+            doIsortFormat=true
+            doBlackFormat=true
         ;;
         --clangformat)
             doClangFormat=true
@@ -284,6 +304,9 @@ do
         ;;
         --pylint)
             doPylintFormat=true
+        ;;
+        --ruff)
+            doRuffFormat=true
         ;;
         --precommit)
             doPrecommit=true
@@ -318,6 +341,10 @@ do
             print_error_msg "nounittest option is deprecated, no unit tests is the default setting"
             print_usage
         ;;
+        -p|--path)
+            testdir=$2
+            shift
+        ;;
         *)
             print_error_msg "Incorrect commandline provided, invalid key: $key"
             print_usage
@@ -327,7 +354,14 @@ do
 done
 
 # home directory
-homedir="$( cd -P "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+currentdir="$( cd -P "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+if [ -e "$testdir" ]
+then
+    homedir=$testdir
+else
+    homedir=$currentdir
+fi
+echo "Run tests under $homedir"
 cd "$homedir"
 
 # python path
@@ -447,9 +481,9 @@ then
 
     if [ $doIsortFix = true ]
     then
-        ${cmdPrefix}${PY_EXE} -m isort "$(pwd)"
+        ${cmdPrefix}${PY_EXE} -m isort "$homedir"
     else
-        ${cmdPrefix}${PY_EXE} -m isort --check "$(pwd)"
+        ${cmdPrefix}${PY_EXE} -m isort --check "$homedir"
     fi
 
     isort_status=$?
@@ -483,9 +517,9 @@ then
 
     if [ $doBlackFix = true ]
     then
-        ${cmdPrefix}${PY_EXE} -m black --skip-magic-trailing-comma "$(pwd)"
+        ${cmdPrefix}${PY_EXE} -m black --skip-magic-trailing-comma "$homedir"
     else
-        ${cmdPrefix}${PY_EXE} -m black --skip-magic-trailing-comma --check "$(pwd)"
+        ${cmdPrefix}${PY_EXE} -m black --skip-magic-trailing-comma --check "$homedir"
     fi
 
     black_status=$?
@@ -512,7 +546,7 @@ then
     fi
     ${cmdPrefix}${PY_EXE} -m flake8 --version
 
-    ${cmdPrefix}${PY_EXE} -m flake8 "$(pwd)" --count --statistics
+    ${cmdPrefix}${PY_EXE} -m flake8 "$homedir" --count --statistics
 
     flake8_status=$?
     if [ ${flake8_status} -ne 0 ]
@@ -533,7 +567,8 @@ then
     # ensure that the necessary packages for code format testing are installed
     if ! is_pip_installed pylint
     then
-        install_deps
+        echo "Pip installing pylint ..."
+        ${cmdPrefix}${PY_EXE} -m pip install "pylint>2.16,!=3.0.0"
     fi
     ${cmdPrefix}${PY_EXE} -m pylint --version
 
@@ -545,6 +580,42 @@ then
     then
         print_style_fail_msg
         exit ${pylint_status}
+    else
+        echo "${green}passed!${noColor}"
+    fi
+    set -e # enable exit on failure
+fi
+
+
+if [ $doRuffFormat = true ]
+then
+    set +e  # disable exit on failure so that diagnostics can be given on failure
+    if [ $doRuffFix = true ]
+    then
+        echo "${separator}${blue}ruff-fix${noColor}"
+    else
+        echo "${separator}${blue}ruff${noColor}"
+    fi
+
+    # ensure that the necessary packages for code format testing are installed
+    if ! is_pip_installed ruff
+    then
+        install_deps
+    fi
+    ruff --version
+
+    if [ $doRuffFix = true ]
+    then
+        ruff check --fix "$homedir"
+    else
+        ruff check "$homedir"
+    fi
+
+    ruff_status=$?
+    if [ ${ruff_status} -ne 0 ]
+    then
+        print_style_fail_msg
+        exit ${ruff_status}
     else
         echo "${green}passed!${noColor}"
     fi
@@ -568,7 +639,7 @@ then
     else
         ${cmdPrefix}${PY_EXE} -m pytype --version
 
-        ${cmdPrefix}${PY_EXE} -m pytype -j ${NUM_PARALLEL} --python-version="$(${PY_EXE} -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")" "$(pwd)"
+        ${cmdPrefix}${PY_EXE} -m pytype -j ${NUM_PARALLEL} --python-version="$(${PY_EXE} -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")" "$homedir"
 
         pytype_status=$?
         if [ ${pytype_status} -ne 0 ]
@@ -594,7 +665,7 @@ then
         install_deps
     fi
     ${cmdPrefix}${PY_EXE} -m mypy --version
-    ${cmdPrefix}${PY_EXE} -m mypy "$(pwd)"
+    ${cmdPrefix}${PY_EXE} -m mypy "$homedir"
 
     mypy_status=$?
     if [ ${mypy_status} -ne 0 ]

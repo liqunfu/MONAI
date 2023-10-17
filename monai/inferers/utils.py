@@ -116,7 +116,7 @@ def _show_image_and_output_tensor(input_tensor, output_tensor, output_tensor2=No
     plt.show()
 
 def sliding_window_inference(
-    inputs: torch.Tensor,
+    inputs: torch.Tensor | MetaTensor,
     roi_size: Sequence[int] | int,
     sw_batch_size: int,
     predictor: Callable[..., torch.Tensor | Sequence[torch.Tensor] | dict[Any, torch.Tensor]],
@@ -132,6 +132,7 @@ def sliding_window_inference(
     process_fn: Callable | None = None,
     buffer_steps: int | None = None,
     buffer_dim: int = -1,
+    with_coord: bool = False,
     *args: Any,
     **kwargs: Any,
 ) -> torch.Tensor | tuple[torch.Tensor, ...] | dict[Any, torch.Tensor]:
@@ -200,6 +201,8 @@ def sliding_window_inference(
             (i.e. no overlapping among the buffers) non_blocking copy may be automatically enabled for efficiency.
         buffer_dim: the spatial dimension along which the buffers are created.
             0 indicates the first spatial dimension. Default is -1, the last spatial dimension.
+        with_coord: whether to pass the window coordinates to ``predictor``. Default is False.
+            If True, the signature of ``predictor`` should be ``predictor(patch_data, patch_coord, ...)``.
         args: optional args to be passed to ``predictor``.
         kwargs: optional keyword args to be passed to ``predictor``.
 
@@ -295,7 +298,10 @@ def sliding_window_inference(
             win_data = torch.cat([inputs[win_slice] for win_slice in unravel_slice]).to(sw_device)
         else:
             win_data = inputs[unravel_slice[0]].to(sw_device)
-        seg_prob_out = predictor(win_data, *args, **kwargs)  # batched patch
+        if with_coord:
+            seg_prob_out = predictor(win_data, unravel_slice, *args, **kwargs)  # batched patch
+        else:
+            seg_prob_out = predictor(win_data, *args, **kwargs)  # batched patch
 
         show_tensor: bool = False
         if show_tensor:
@@ -359,7 +365,7 @@ def sliding_window_inference(
             else:
                 sw_device_buffer[ss] *= w_t
                 sw_device_buffer[ss] = sw_device_buffer[ss].to(device)
-                _compute_coords(sw_batch_size, unravel_slice, z_scale, output_image_list[ss], sw_device_buffer[ss])
+                _compute_coords(unravel_slice, z_scale, output_image_list[ss], sw_device_buffer[ss])
         sw_device_buffer = []
         if buffered:
             b_s += 1
@@ -386,9 +392,11 @@ def sliding_window_inference(
             output_image_list[ss] = output_i[(slice(None), slice(None), *final_slicing)]
 
     final_output = _pack_struct(output_image_list, dict_keys)
-    final_output = convert_to_dst_type(final_output, inputs, device=device)[0]  # type: ignore
     if temp_meta is not None:
-        final_output = MetaTensor(final_output).copy_meta_from(temp_meta)
+        final_output = convert_to_dst_type(final_output, temp_meta, device=device)[0]
+    else:
+        final_output = convert_to_dst_type(final_output, inputs, device=device)[0]
+
     return final_output  # type: ignore
 
 
@@ -401,7 +409,7 @@ def _create_buffered_slices(slices, batch_size, sw_batch_size, buffer_dim, buffe
 
     _, _, _b_lens = np.unique(slices_np[:, 0], return_counts=True, return_index=True)
     b_ends = np.cumsum(_b_lens).tolist()  # possible buffer flush boundaries
-    x = [0, *b_ends][:: min(len(b_ends), int(buffer_steps))]  # type: ignore
+    x = [0, *b_ends][:: min(len(b_ends), int(buffer_steps))]
     if x[-1] < b_ends[-1]:
         x.append(b_ends[-1])
     n_per_batch = len(x) - 1
@@ -419,7 +427,7 @@ def _create_buffered_slices(slices, batch_size, sw_batch_size, buffer_dim, buffe
     return slices, n_per_batch, b_slices, windows_range
 
 
-def _compute_coords(sw, coords, z_scale, out, patch):
+def _compute_coords(coords, z_scale, out, patch):
     """sliding window batch spatial scaling indexing for multi-resolution outputs."""
     for original_idx, p in zip(coords, patch):
         idx_zm = list(original_idx)  # 4D for 2D image, 5D for 3D image
@@ -464,7 +472,7 @@ def _flatten_struct(seg_out):
         dict_keys = sorted(seg_out.keys())  # track predictor's output keys
         seg_probs = tuple(seg_out[k] for k in dict_keys)
     else:
-        seg_probs = ensure_tuple(seg_out)  # type: ignore
+        seg_probs = ensure_tuple(seg_out)
     return dict_keys, seg_probs
 
 

@@ -174,6 +174,7 @@ class TestConfigParser(unittest.TestCase):
             self.assertTrue(isinstance(v, cls))
         # test default value
         self.assertEqual(parser.get_parsed_content(id="abc", default=ConfigItem(12345, "abc")), 12345)
+        self.assertEqual(parser.get_parsed_content(id="abcd", default=1), 1)
 
     @parameterized.expand([TEST_CASE_2])
     def test_function(self, config):
@@ -312,6 +313,12 @@ class TestConfigParser(unittest.TestCase):
     def test_builtin(self):
         config = {"import statements": "$import math", "calc": {"_target_": "math.isclose", "a": 0.001, "b": 0.001}}
         self.assertEqual(ConfigParser(config).calc, True)
+
+    def test_slicing(self):
+        config = {"test": [1, 2, 3, 4], "test1": "$@test[::]", "test2": "$@test[::-1]", "st": "aten::relu"}
+        self.assertEqual(ConfigParser(config).test1, [1, 2, 3, 4])
+        self.assertEqual(ConfigParser(config).test2, [4, 3, 2, 1])
+        self.assertEqual(ConfigParser(config).st, "aten::relu")
 
     @parameterized.expand([TEST_CASE_5])
     def test_substring_reference(self, config, expected):
