@@ -11,21 +11,14 @@
 
 from __future__ import annotations
 
-import warnings
 from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
 import torch
 
-from monai.metrics.utils import (
-    do_metric_reduction,
-    get_mask_edges,
-    get_surface_distance,
-    ignore_background,
-    prepare_spacing,
-)
-from monai.utils import MetricReduction, convert_data_type
+from monai.metrics.utils import do_metric_reduction, get_edge_surface_distance, ignore_background, prepare_spacing
+from monai.utils import MetricReduction
 
 from .metric import CumulativeIterationMetric
 
@@ -36,7 +29,7 @@ class SurfaceDiceMetric(CumulativeIterationMetric):
     predicted segmentations `y_pred` and corresponding reference segmentations `y` according to equation :eq:`nsd`.
     This implementation is based on https://arxiv.org/abs/2111.05408 and supports 2D and 3D images.
     Be aware that by default (`use_subvoxels=False`), the computation of boundaries is different from DeepMind's
-    mplementation https://github.com/deepmind/surface-distance.
+    implementation https://github.com/deepmind/surface-distance.
     In this implementation, the length/area of a segmentation boundary is
     interpreted as the number of its edge pixels. In DeepMind's implementation, the length of a segmentation boundary
     depends on the local neighborhood (cf. https://arxiv.org/abs/1809.04430).
@@ -63,6 +56,7 @@ class SurfaceDiceMetric(CumulativeIterationMetric):
             `not_nans` is the number of batch samples for which not all class-specific NSD values were nan values.
             If set to ``True``, the function `aggregate` will return both the aggregated NSD and the `not_nans` count.
             If set to ``False``, `aggregate` will only return the aggregated NSD.
+        use_subvoxels: Whether to use subvoxel distances. Defaults to ``False``.
     """
 
     def __init__(
@@ -72,6 +66,7 @@ class SurfaceDiceMetric(CumulativeIterationMetric):
         distance_metric: str = "euclidean",
         reduction: MetricReduction | str = MetricReduction.MEAN,
         get_not_nans: bool = False,
+        use_subvoxels: bool = False,
     ) -> None:
         super().__init__()
         self.class_thresholds = class_thresholds
@@ -79,6 +74,7 @@ class SurfaceDiceMetric(CumulativeIterationMetric):
         self.distance_metric = distance_metric
         self.reduction = reduction
         self.get_not_nans = get_not_nans
+        self.use_subvoxels = use_subvoxels
 
     def _compute_tensor(self, y_pred: torch.Tensor, y: torch.Tensor, **kwargs: Any) -> torch.Tensor:  # type: ignore[override]
         r"""
@@ -111,7 +107,7 @@ class SurfaceDiceMetric(CumulativeIterationMetric):
             include_background=self.include_background,
             distance_metric=self.distance_metric,
             spacing=kwargs.get("spacing"),
-            use_subvoxels=kwargs.get("use_subvoxels", False),
+            use_subvoxels=self.use_subvoxels,
         )
 
     def aggregate(
@@ -248,47 +244,39 @@ def compute_surface_dice(
     if any(np.array(class_thresholds) < 0):
         raise ValueError("All class thresholds need to be >= 0.")
 
-    nsd = np.empty((batch_size, n_class))
+    nsd = torch.empty((batch_size, n_class), device=y_pred.device, dtype=torch.float)
 
     img_dim = y_pred.ndim - 2
     spacing_list = prepare_spacing(spacing=spacing, batch_size=batch_size, img_dim=img_dim)
 
     for b, c in np.ndindex(batch_size, n_class):
+        (edges_pred, edges_gt), (distances_pred_gt, distances_gt_pred), areas = get_edge_surface_distance(  # type: ignore
+            y_pred[b, c],
+            y[b, c],
+            distance_metric=distance_metric,
+            spacing=spacing_list[b],
+            use_subvoxels=use_subvoxels,
+            symetric=True,
+            class_index=c,
+        )
+        boundary_correct: int | torch.Tensor | float
+        boundary_complete: int | torch.Tensor | float
         if not use_subvoxels:
-            (edges_pred, edges_gt) = get_mask_edges(y_pred[b, c], y[b, c], crop=True)
-            distances_pred_gt = get_surface_distance(
-                edges_pred, edges_gt, distance_metric=distance_metric, spacing=spacing_list[b]
-            )
-            distances_gt_pred = get_surface_distance(
-                edges_gt, edges_pred, distance_metric=distance_metric, spacing=spacing_list[b]
-            )
-
             boundary_complete = len(distances_pred_gt) + len(distances_gt_pred)
-            boundary_correct = np.sum(distances_pred_gt <= class_thresholds[c]) + np.sum(
+            boundary_correct = torch.sum(distances_pred_gt <= class_thresholds[c]) + torch.sum(
                 distances_gt_pred <= class_thresholds[c]
             )
         else:
-            _spacing = spacing_list[b] if spacing_list[b] is not None else [1] * img_dim
-            areas_pred: np.ndarray
-            areas_gt: np.ndarray
-            edges_pred, edges_gt, areas_pred, areas_gt = get_mask_edges(  # type: ignore
-                y_pred[b, c], y[b, c], crop=True, spacing=_spacing  # type: ignore
-            )
-            dist_pred_to_gt = get_surface_distance(edges_pred, edges_gt, distance_metric, spacing=spacing_list[b])
-            dist_gt_to_pred = get_surface_distance(edges_gt, edges_pred, distance_metric, spacing=spacing_list[b])
+            areas_pred, areas_gt = areas  # type: ignore
             areas_gt, areas_pred = areas_gt[edges_gt], areas_pred[edges_pred]
             boundary_complete = areas_gt.sum() + areas_pred.sum()
-            gt_true = areas_gt[dist_gt_to_pred <= class_thresholds[c]].sum() if len(areas_gt) > 0 else 0.0
-            pred_true = areas_pred[dist_pred_to_gt <= class_thresholds[c]].sum() if len(areas_pred) > 0 else 0.0
+            gt_true = areas_gt[distances_gt_pred <= class_thresholds[c]].sum() if len(areas_gt) > 0 else 0.0
+            pred_true = areas_pred[distances_pred_gt <= class_thresholds[c]].sum() if len(areas_pred) > 0 else 0.0
             boundary_correct = gt_true + pred_true
-        if not np.any(edges_gt):
-            warnings.warn(f"the ground truth of class {c} is all 0, this may result in nan/inf distance.")
-        if not np.any(edges_pred):
-            warnings.warn(f"the prediction of class {c} is all 0, this may result in nan/inf distance.")
         if boundary_complete == 0:
             # the class is neither present in the prediction, nor in the reference segmentation
-            nsd[b, c] = np.nan
+            nsd[b, c] = torch.tensor(np.nan)
         else:
             nsd[b, c] = boundary_correct / boundary_complete
 
-    return convert_data_type(nsd, output_type=torch.Tensor, device=y_pred.device, dtype=torch.float)[0]
+    return nsd
