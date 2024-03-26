@@ -246,13 +246,28 @@ def normalize_transform(
     if align_corners:
         norm[norm <= 1.0] = 2.0
         norm = 2.0 / (norm if zero_centered else norm - 1.0)
-        norm = torch.diag(torch.cat((norm, torch.ones((1,), dtype=torch.float64, device=device))))
+        
+        # https://github.com/pytorch/pytorch/issues/98205
+        workaround_98205 = True
+        if workaround_98205:
+            norm = torch.cat((norm, torch.ones((1,), dtype=torch.float64, device=device)))
+            e = torch.eye(len(norm))
+            norm = e * norm
+        else:
+            norm = torch.diag(torch.cat((norm, torch.ones((1,), dtype=torch.float64, device=device))))
         if not zero_centered:  # else shift is 0
             norm[:-1, -1] = -1.0
     else:
         norm[norm <= 0.0] = 2.0
         norm = 2.0 / (norm - 1.0 if zero_centered else norm)
-        norm = torch.diag(torch.cat((norm, torch.ones((1,), dtype=torch.float64, device=device))))
+        # https://github.com/pytorch/pytorch/issues/98205
+        workaround_98205 = True
+        if workaround_98205:
+            norm = torch.cat((norm, torch.ones((1,), dtype=torch.float64, device=device)))
+            e = torch.eye(len(norm))
+            norm = e * norm
+        else:
+            norm = torch.diag(torch.cat((norm, torch.ones((1,), dtype=torch.float64, device=device))))
         if not zero_centered:
             norm[:-1, -1] = 1.0 / shape - 1.0
     norm = norm.unsqueeze(0).to(dtype=dtype)
